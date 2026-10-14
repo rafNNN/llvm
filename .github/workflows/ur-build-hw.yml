@@ -46,8 +46,11 @@ env:
 jobs:
   adapter_build_hw:
     name: Build & CTS
-    # run only on upstream; forks won't have the HW
-    if: github.repository == 'intel/llvm'
+    # The fork has a dedicated CUDA 13 runner; other hardware remains upstream-only.
+    if: >-
+      github.repository == 'intel/llvm' ||
+      (github.repository == 'rafNNN/llvm' &&
+       inputs.adapter_name == 'CUDA' && inputs.runner_name == 'cuda13')
     strategy:
       fail-fast: false
       matrix:
