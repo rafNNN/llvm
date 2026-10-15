@@ -1,0 +1,164 @@
+name: CUDA 13 local Vulkan repro
+
+# Push this experimental branch to run without a PR or a registry publication.
+# A PR can still trigger the repository's other, independent precommit workflows.
+on:
+  push:
+    branches: [test/cuda13-local-repro]
+    paths:
+      - '.github/workflows/cuda13-local-repro.yml'
+      - 'devops/scripts/cuda13_local_repro.sh'
+      - 'devops/containers/ubuntu2404_build_cuda131.Dockerfile'
+      - 'devops/containers/ubuntu2404_intel_drivers_cuda131.Dockerfile'
+      - 'devops/scripts/**'
+      - 'devops/dependencies.json'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cuda13-local-repro
+  cancel-in-progress: false
+
+jobs:
+  repro:
+    if: github.repository == 'rafNNN/llvm'
+    runs-on: [self-hosted, Linux, X64, cuda13]
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    env:
+      BASE_IMAGE: cuda13-repro-base:${{ github.run_id }}-${{ github.run_attempt }}
+      TEST_IMAGE: cuda13-repro-test:${{ github.run_id }}-${{ github.run_attempt }}
+      CONTAINER_NAME: cuda13-repro-${{ github.run_id }}-${{ github.run_attempt }}
+      TOOLCHAIN_TAG: nightly-2026-10-14
+      TOOLCHAIN_SHA256: e54240d5830bc7e251ddc9500cec7ea05f15e8ab8e288c1f01d7bd7d169e022f
+      TOOLCHAIN_SOURCE_SHA: dfcf0080a27749a5c8c73b9d83658593726b01ea
+
+    steps:
+      - name: Prepare per-run scratch directory
+        run: |
+          repro_dir="$RUNNER_TEMP/cuda13-repro-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$repro_dir/logs" "$repro_dir/work"
+          echo "REPRO_DIR=$repro_dir" >> "$GITHUB_ENV"
+
+      - name: Checkout experiment
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          sparse-checkout: devops
+
+      - name: Checkout tests matching the compiler release
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: intel/llvm
+          ref: ${{ env.TOOLCHAIN_SOURCE_SHA }}
+          path: repro-sources
+          persist-credentials: false
+          sparse-checkout: |
+            sycl/test-e2e
+            llvm/utils/lit
+
+      - name: Check host and record inputs
+        run: |
+          {
+            printf 'Experiment: %s\nCompiler: %s\nCompiler sources: %s\n' \
+              "$GITHUB_SHA" "$TOOLCHAIN_TAG" "$TOOLCHAIN_SOURCE_SHA"
+            printf 'Base image: %s\nTest image: %s\n' "$BASE_IMAGE" "$TEST_IMAGE"
+            uname -a
+            nvidia-smi
+            docker version
+            docker buildx inspect default
+            df -h "$RUNNER_TEMP"
+            docker info --format 'Docker root: {{.DockerRootDir}}'
+          } 2>&1 | tee "$REPRO_DIR/logs/host.log"
+          docker_root=$(docker info --format '{{.DockerRootDir}}')
+          for path in "$RUNNER_TEMP" "$docker_root"; do
+            available=$(df -Pk "$path" | awk 'NR == 2 {print $4}')
+            if (( available < 80 * 1024 * 1024 )); then
+              echo "::error::Need at least 80 GiB free on $path for CUDA/ROCm/Vulkan builds."
+              exit 1
+            fi
+          done
+          cp devops/containers/ubuntu2404_{build,intel_drivers}_cuda131.Dockerfile \
+            devops/dependencies.json devops/scripts/install_vulkan.sh "$REPRO_DIR/logs/"
+
+      - name: Build unmodified CUDA 13 base locally
+        timeout-minutes: 180
+        run: |
+          docker buildx build --builder default --load --progress plain \
+            --tag "$BASE_IMAGE" \
+            --file devops/containers/ubuntu2404_build_cuda131.Dockerfile \
+            devops 2>&1 | tee "$REPRO_DIR/logs/build-base.log"
+          docker image inspect "$BASE_IMAGE" > "$REPRO_DIR/logs/base-image.json"
+
+      - name: Build driver image from the local base
+        timeout-minutes: 60
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          # Do not use devops/actions/build_container: it logs in to GHCR.
+          # The default Docker builder shares the local image store with docker run.
+          docker buildx build --builder default --load --pull=false --progress plain \
+            --build-arg "base_image=${BASE_IMAGE%:*}" \
+            --build-arg "base_tag=${BASE_IMAGE##*:}" \
+            --secret id=github_token,env=GITHUB_TOKEN \
+            --tag "$TEST_IMAGE" \
+            --file devops/containers/ubuntu2404_intel_drivers_cuda131.Dockerfile \
+            devops 2>&1 | tee "$REPRO_DIR/logs/build-drivers.log"
+          docker image inspect "$TEST_IMAGE" > "$REPRO_DIR/logs/test-image.json"
+
+      - name: Run Vulkan diagnostics and the SYCL repro
+        # Four builds (600s each), eight executions (300s each), and setup.
+        timeout-minutes: 110
+        run: |
+          # No job-level container: the image must be built before it can be used.
+          # Match the GPU flags from SYCL E2E, without enabling graphics injection.
+          # Use the runner's UID/GID so that logs and scratch files remain accessible.
+          docker run --rm --pull=never --name "$CONTAINER_NAME" \
+            --user "$(id -u):$(id -g)" --gpus all --cap-add SYS_ADMIN \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace,readonly" \
+            --mount "type=bind,source=$REPRO_DIR,target=/results" \
+            --env HOME=/results/work/home \
+            --env TOOLCHAIN_TAG --env TOOLCHAIN_SHA256 --env TOOLCHAIN_SOURCE_SHA \
+            --entrypoint /bin/bash "$TEST_IMAGE" \
+            /workspace/devops/scripts/cuda13_local_repro.sh \
+            2>&1 | tee "$REPRO_DIR/logs/repro.log"
+
+      - name: Remove only this run's container if interrupted
+        if: always()
+        run: |
+          container_id=$(docker ps -aq --filter "name=^/${CONTAINER_NAME}$")
+          if [[ -n "$container_id" ]]; then
+            docker rm -f "$container_id"
+          fi
+
+      - name: Summarize result
+        if: always()
+        run: |
+          {
+            echo "### CUDA 13 local Vulkan repro (no driver fix)"
+            echo "Local image: \`$TEST_IMAGE\`"
+            echo "Compiler: \`$TOOLCHAIN_TAG\`; sources: \`$TOOLCHAIN_SOURCE_SHA\`"
+            echo "Four former timeout tests, each run twice; three CUDA 13 exclusions removed only in scratch sources."
+            echo
+            if [[ -f "$REPRO_DIR/logs/result.txt" ]]; then
+              cat "$REPRO_DIR/logs/result.txt"
+            else
+              echo "Repro did not reach test reporting. Check checkout, build and container logs."
+            fi
+            echo
+            echo "Images and scratch files remain on CUDA13; no registry push or global prune."
+            echo "Scratch directory: \`$REPRO_DIR\`"
+            echo "This is a fresh baseline, not a byte-identical copy of the old GHCR image."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cuda13-local-repro-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.REPRO_DIR }}/logs
+          if-no-files-found: error
+          retention-days: 7
