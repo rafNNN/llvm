@@ -70,13 +70,13 @@ cmake -GNinja -S "$sources/sycl/test-e2e" -B "$work/build-e2e" \
   -DCMAKE_CXX_COMPILER="$work/toolchain/bin/dpclang++" \
   -DLLVM_LIT="$sources/llvm/utils/lit/lit.py" \
   -DSYCL_TEST_E2E_TARGETS=cuda:gpu \
-  -DCMAKE_CXX_FLAGS="-fsycl-targets=nvptx64-nvidia-cuda --cuda-gpu-arch=sm_75" \
   2>&1 | tee "$logs/configure.log"
 cp "$work/build-e2e/CMakeCache.txt" "$logs/"
 
 lit=(python3 "$sources/llvm/utils/lit/lit.py"
   -v --no-progress-bar --show-pass --show-unsupported --time-tests -j 1
   --param sycl_devices=cuda:gpu --param sycl_build_targets=nvidia
+  --param cxx_flags=--cuda-gpu-arch=sm_75
   --param print_features=True
   --filter "^SYCL :: ${test_name//./\\.}$")
 
