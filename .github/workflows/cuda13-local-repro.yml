@@ -24,7 +24,7 @@ jobs:
   repro:
     if: github.repository == 'rafNNN/llvm'
     runs-on: [self-hosted, Linux, X64, cuda13]
-    timeout-minutes: 240
+    timeout-minutes: 360
     defaults:
       run:
         shell: bash
@@ -110,7 +110,8 @@ jobs:
           docker image inspect "$TEST_IMAGE" > "$REPRO_DIR/logs/test-image.json"
 
       - name: Run Vulkan diagnostics and the SYCL repro
-        timeout-minutes: 35
+        # Four builds (600s each), eight executions (300s each), and setup.
+        timeout-minutes: 110
         run: |
           # No job-level container: the image must be built before it can be used.
           # Match the GPU flags from SYCL E2E, without enabling graphics injection.
@@ -140,6 +141,7 @@ jobs:
             echo "### CUDA 13 local Vulkan repro (no driver fix)"
             echo "Local image: \`$TEST_IMAGE\`"
             echo "Compiler: \`$TOOLCHAIN_TAG\`; sources: \`$TOOLCHAIN_SOURCE_SHA\`"
+            echo "Four former timeout tests, each run twice; three CUDA 13 exclusions removed only in scratch sources."
             echo
             if [[ -f "$REPRO_DIR/logs/result.txt" ]]; then
               cat "$REPRO_DIR/logs/result.txt"
